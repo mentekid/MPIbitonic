@@ -12,6 +12,7 @@ void keepLow(int *, int *, int);
 void talkWith(int *, int, int);
 void takeAction(int*, int, int);
 char *test(int *, int);
+unsigned long arraySum(int*, int);
 
 int main(int argc, char *argv[]){
     int numTasks; 
@@ -22,7 +23,7 @@ int main(int argc, char *argv[]){
     MPI_Comm_rank(MPI_COMM_WORLD, &taskID);
 
     /*
-     *MASTER: check if input is correct and generates seeds
+     *MASTER: check if input is correct 
      */
     if(taskID == 0){
         if (argc != 3){
@@ -32,6 +33,8 @@ int main(int argc, char *argv[]){
             printf("Warning: run with mpirun --np %d %s %s %s for %d processes.\n",
                     1<<atoi(argv[1]), argv[0], argv[1], argv[2], 1<<atoi(argv[1]));
             MPI_Abort(MPI_COMM_WORLD, 2);
+        }else{
+            printf("Running bitonic sort with %d processes and %d integers on each\n", 1<<atoi(argv[1]), 1<<atoi(argv[2]));
         }
 
     }
@@ -47,21 +50,25 @@ int main(int argc, char *argv[]){
     int numElements = 1<<q; 
     
     //each process uses taskID to seed random
-    srand(time(NULL)+taskID*numTasks);
+    srand(time(NULL)*taskID+numTasks);
 
-    //two arrays, one for my data (generated at random) and one for partner's data (changes at every step)
+    //two arrays, one for "my" (=process) data (generated at random) and one for partner's data (changes at every step)
     int *myArray;
     myArray = (int *)malloc(numElements*sizeof(int)); 
     generate(numElements, numTasks, myArray); 
+    unsigned long sumStart = arraySum(myArray, numElements); //keep sum of all elements (used for parity test)
+    unsigned long totalSumStart=0;
+    MPI_Reduce(&sumStart, &totalSumStart, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD); //master keeps sum of all sums
 
     int *partnerArray;
     partnerArray = (int *)malloc(numElements*sizeof(int));
 
-    
     /*
      * Sorting begins here
      */
-    double start =MPI_Wtime();
+    struct timeval startwtime, endwtime;
+    MPI_Barrier(MPI_COMM_WORLD); 
+    gettimeofday(&startwtime, NULL);
     qsort(myArray, numElements, sizeof(int), cmpfunc); //locally sort array
     
     MPI_Status status;
@@ -116,18 +123,28 @@ int main(int argc, char *argv[]){
     /*
      * Sorting ends here
      */
-    double end = MPI_Wtime();
+    MPI_Barrier(MPI_COMM_WORLD); 
+    gettimeofday(&endwtime, NULL);
+    double time = (double)((endwtime.tv_usec - startwtime.tv_usec)/1.0e6 + endwtime.tv_sec - startwtime.tv_sec);
+
+    free(partnerArray); //not needed any more
 
     /*Testing that: 
-     * -local data is sorted
-     * -task's smallest number (myArray[0]) is larger or equal that previous task's largest
-     *  there is no test that during the sorting no data was lost. That would require O(n) extra space for the initial array
+     * 1. local array is sorted
+     * 2. each task's smallest number (myArray[0]) is larger or equal than previous task's largest
+     * 3. element sum at the beginning and end of the process is the same.
+     *
+     * Tests 1&2 ensure sorting was done properly
+     * Test 3 ensures no number was lost during the process
      */
-    
+    unsigned long sumEnd = arraySum(myArray, numElements);
+    unsigned long totalSumEnd=0;
+    MPI_Reduce(&sumEnd, &totalSumEnd, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD); //master keeps sum of all sums again
+
     for(i=0; i<numTasks; i++){
         if(taskID==i){
             printf("task %d locality test:\t %s\n", taskID, test(myArray, numElements));
-            if (taskID > 0){ //exclude first task (master) from receiving
+            if (taskID > 0){ //exclude first task from receiving
                 int lastElm;
                 MPI_Recv(&lastElm,
                         1,
@@ -153,55 +170,38 @@ int main(int argc, char *argv[]){
         MPI_Barrier(MPI_COMM_WORLD);
     }
     free(myArray);
-    free(partnerArray); 
 
     //keep minimum start time and maximum end time in master
-    double totalStart, totalEnd;
-    MPI_Reduce(&start, &totalStart, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&end, &totalEnd, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    double maxTime;
+    MPI_Reduce(&time, &maxTime, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if(taskID==0){
-        printf("Sorting time: %fs\n", totalEnd - totalStart);
+        printf("Master parity test:\t %s\n", (totalSumStart==totalSumEnd)?"PASS":"FAIL"); 
+        printf("Sorting time: %fs\n",maxTime); 
     }
-
     MPI_Finalize();
 
     return 0;
 }
 
+// Functions
+
+/* function generate: 
+ * Stores random integers inside myArray. Uses numElements and numTasks to produce an upper limit.
+ */
 void generate(const int numElements, const int numTasks, int *myArray){
     int i=0;
-    int lim = numElements*numTasks*10; //reduce collision chance
+    int lim = numElements*numTasks*10; //reduce collision chance by increasing range
     for(i=0; i<numElements; i++){
         myArray[i] = rand()%lim;
     }
 }
 
+//function cmpfunc: needed for quicksort
 int cmpfunc(const void *a, const void *b){
     return ( *(int*)a - *(int*)b);
 }
-void keepLow(int *myArray, int *partnerArray, int numElements){
-    int i=0;
-    for(i=0; i < numElements; i++){
-        if (partnerArray[i]<=myArray[numElements-1-i]){
-            myArray[numElements-1-i] = partnerArray[i];
-        }else{
-            break;
-        }
-    }
-    qsort(myArray, numElements, sizeof(int), cmpfunc); 
 
-}
-void keepHigh(int *myArray, int *partnerArray, int numElements){
-    int i=0;
-    for(i=0; i < numElements; i++){
-        if (partnerArray[numElements-1-i] >= myArray[i]) {
-            myArray[i]=partnerArray[numElements-1-i];
-        }else{
-            break;
-        }
-    }
-    qsort(myArray, numElements, sizeof(int), cmpfunc);
-}
+//scans entire array to find out-of-order items
 char *test(int *myArray, int numElements) {
     int pass = 1;
     int i;
@@ -210,4 +210,51 @@ char *test(int *myArray, int numElements) {
     }
 
     return (pass) ? "PASS" : "FAIL";
+}
+
+//sums all elements in array
+unsigned long arraySum(int *sumArray, int numElements){
+    int i=0;
+    unsigned long sum=0;
+    for(i=0; i< numElements; i++){
+        sum+=sumArray[i];
+    }
+    return sum;
+}
+
+/*
+ *bitonic sorting functions keepLow, keepHigh: 
+ *instead of sorting half the data ascending and the other descending, 
+ *we imitate bitonic distribution by ascending one array and descending the other
+ */
+
+/*
+ * function keepLow keeps the small corresponding elements from the two arrays 
+ */
+void keepLow(int *myArray, int *partnerArray, int numElements){
+    int i=0;
+    for(i=0; i < numElements; i++){
+        if (partnerArray[i]<=myArray[numElements-1-i]){
+            myArray[numElements-1-i] = partnerArray[i];
+        }else{
+            break; //since this is bitonic, if no swap was needed it means all unscanned elements in myArray are smaller than partner array
+        }
+    }
+    qsort(myArray, numElements, sizeof(int), cmpfunc); 
+
+}
+
+/*
+ * function keepHigh keeps the large corresponding elements from the two arrays
+ */
+void keepHigh(int *myArray, int *partnerArray, int numElements){
+    int i=0;
+    for(i=0; i < numElements; i++){
+        if (partnerArray[numElements-1-i] >= myArray[i]) {
+            myArray[i]=partnerArray[numElements-1-i];
+        }else{
+            break; //since this is bitonic, if no swap was needed it means all unscanned elements in myArray are larger than partner array
+        }
+    }
+    qsort(myArray, numElements, sizeof(int), cmpfunc);
 }
